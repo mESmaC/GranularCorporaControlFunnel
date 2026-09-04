@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.DS_Store
+classifier/models/
+classifier/__pycache__/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
