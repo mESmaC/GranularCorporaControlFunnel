@@ -15,10 +15,11 @@ gigabytes of pretraining corpora **without ever copying or loading them**:
    in your editor, not through the app.
 5. **Receipt** — export a versioned JSON *ingestion receipt* (file verdicts,
    per-record exclusions, tags, locators) that the training-prep tool consumes.
-6. **Classifier** — export every decision as training data, train a model, and
-   run it back over samples with up to 8 worker processes (GPU inside the
-   worker). Predictions show up as hints in the reviewer and can be bulk-applied
-   above a confidence threshold to still-pending samples.
+6. **Classifier loop** — annotate → train → evaluate blind on real data →
+   finetune on the disagreements → run once it clears the gate. Training
+   happens in-app (built-in Rust model, or your own trainer command); up to 8
+   workers score in parallel; evaluation is read-only and blind; a report
+   shows accuracy, calibration, tag agreement and every disagreement.
 
 Everything GCCF knows lives in one SQLite file. Corpora on disk are read-only
 to it.
@@ -70,14 +71,35 @@ immediately; the verdict snapshots the tags and the time spent looking.
 include/exclude thresholds, preview the outcome, write the JSON. Schema:
 [docs/receipt-schema.md](docs/receipt-schema.md).
 
-**Classifier** →
+**Classifier** → the screen walks the loop top to bottom:
+
+1. **Annotate.** At least 20 good/bad decisions (more is better).
+2. **Train.** *Built-in* trains a hashed word/char n-gram logistic regression
+   in-process (no Python) with a stratified hold-out; *External* exports the
+   JSONL and runs your command with `{data}` / `{model}` / `{parent_model}`
+   substituted, streaming its output into the app. Both register a model.
+3. **Evaluate.** Pick the model, target a session, *Start evaluation*. The
+   model scores pending (unseen) samples read-only; you then review them in
+   the normal card, blind by default — after each decision GCCF reveals what
+   the model said. Your decisions are real annotations too. The report shows
+   accuracy, precision/recall, calibration by confidence bucket, tag
+   agreement, and a list of disagreements to open.
+4. **Finetune.** *Finetune #N on this feedback* warm-starts from the model
+   (same feature space) with evaluation disagreements up-weighted; external
+   trainers get the parent path. Repeat 3 → 4 until the report clears the
+   capability gate (Settings: min accuracy, min blind decisions).
+5. **Run.** Score mode stores predictions as hints; *Apply to pending* above a
+   confidence threshold turns them into classifier-sourced verdicts, never
+   overriding a human one.
+
+Reference scripts for the external path:
 
 ```powershell
-# 1. export decisions (Classifier → Export JSONL) then train the baseline
 py -3 -m pip install -r classifier/requirements.txt
-py -3 classifier/train_classifier.py gccf-training.jsonl --out classifier/models/gccf-clf.joblib
-# 2. in GCCF: backend = external worker, command:
-#    py -3 classifier/worker.py --model classifier/models/gccf-clf.joblib
+# trainer command template (default in the UI):
+#   py -3 classifier/train_classifier.py {data} --out {model} --parent {parent_model}
+# worker command template:
+#   py -3 classifier/worker.py --model {model}
 ```
 
 Worker protocol (JSON lines, blank line terminates a batch each way):
@@ -89,10 +111,11 @@ Worker protocol (JSON lines, blank line terminates a batch each way):
 ←
 ```
 
-Any language / framework works. Each worker process gets `GCCF_WORKER_INDEX`
-so it can pin a GPU. Runs record agreement with human decisions (accuracy,
-precision, recall) whenever they overlap, so you can watch the model earn trust
-before letting it decide.
+Trainer contract: read `{data}`, write `{model}`, optionally print a final
+`{"gccf_metrics": {...}}` line. Any language works. Each worker process gets
+`GCCF_WORKER_INDEX` so it can pin a GPU. Models, runs, predictions and
+evaluation feedback all live in the catalogue; model files go to
+`<catalogue dir>/models/`.
 
 ## How sampling works
 
@@ -118,7 +141,8 @@ src-tauri/src/
   db.rs              schema + queries (SQLite, WAL)
   receipt.rs         ingestion receipt builder
   export.rs          training-data JSONL export
-  classifier/        worker pool, heuristic baseline, external-process backend
+  classifier/        worker pool, heuristic baseline, built-in trainable model,
+                     trainers (in-process + external command), external-process backend
   jobs.rs            background job registry + progress events
   commands.rs        Tauri command surface
 classifier/          reference Python worker + trainer

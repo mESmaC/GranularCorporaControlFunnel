@@ -79,6 +79,17 @@ pub fn export_training_jsonl(
             "text": row.text,
             "text_bytes": row.text_bytes,
             "truncated": row.truncated,
+            // Evaluation feedback: what a model predicted for this sample and
+            // whether the human agreed. `null` when never evaluated.
+            "eval": row.eval.as_ref().map(|e| serde_json::json!({
+                "run_id": e.run_id,
+                "predicted": e.predicted,
+                "score": e.score,
+                "predicted_tags": e.predicted_tags,
+                "human": e.human,
+                "agree": e.agree,
+                "blind": e.blind,
+            })),
         });
         let line = serde_json::to_vec(&obj)?;
         w.write_all(&line)?;

@@ -9,10 +9,14 @@ export const settingsView: View = {
     const threads = h("input", { type: "number", min: 1, max: 64, value: s["sample_threads"] ?? String(state.info?.default_threads ?? 4) });
     const maxKb = h("input", { type: "number", min: 1, value: String(Math.round(Number(s["max_bytes_per_sample"] ?? 262144) / 1024)) });
     const streamGb = h("input", { type: "number", min: 0, step: 0.5, value: String(Number(s["max_stream_bytes"] ?? 0) / 1e9) });
+    const gateAcc = h("input", { type: "number", min: 0.5, max: 1, step: 0.01, value: s["eval_min_accuracy"] ?? "0.9" });
+    const gateN = h("input", { type: "number", min: 1, value: s["eval_min_evaluated"] ?? "100" });
     const saveAll = async () => {
       await guard(api.setSetting("sample_threads", String(Math.max(1, Number(threads.value)))));
       await guard(api.setSetting("max_bytes_per_sample", String(Math.max(1024, Number(maxKb.value) * 1024))));
       await guard(api.setSetting("max_stream_bytes", String(Math.round(Number(streamGb.value) * 1e9))));
+      await guard(api.setSetting("eval_min_accuracy", String(Math.min(1, Math.max(0, Number(gateAcc.value))))));
+      await guard(api.setSetting("eval_min_evaluated", String(Math.max(1, Math.round(Number(gateN.value))))));
       await refreshSettings();
       if (state.info) state.info.default_threads = Number(threads.value);
       toast("Settings saved", "ok", 1500);
@@ -25,6 +29,15 @@ export const settingsView: View = {
           field("Sampling threads", threads, `files sampled concurrently (${state.info?.cpus ?? "?"} cores available)`),
           field("Max KB kept per sample", maxKb, "longer windows are cut and flagged truncated"),
           field("Compressed stream cap (GB)", streamGb, "stop reading a .gz/.zst file after this much decompressed data (0 = whole file)"),
+        ),
+        h("div", { class: "row", style: { marginTop: "12px" } }, h("button", { class: "primary", onClick: saveAll }, "Save")),
+      ),
+      h("div", { class: "card" },
+        h("div", { class: "card-title" }, "Classifier capability gate"),
+        h("p", { class: "small muted", style: { marginTop: 0 } }, "An evaluation run counts as passing when the model agrees with your blind decisions at least this often, over at least this many decisions. The gate is advisory: it labels reports and models, it does not block anything."),
+        h("div", { class: "form-grid" },
+          field("Minimum accuracy", gateAcc, "0.9 = agree on 90% of blind decisions"),
+          field("Minimum blind decisions", gateN, "small n gives noisy accuracy"),
         ),
         h("div", { class: "row", style: { marginTop: "12px" } }, h("button", { class: "primary", onClick: saveAll }, "Save")),
       ),

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 // ---------------------------------------------------------------------------
-// Types mirrored from src-tauri/src/db.rs & commands.rs
+// Types mirrored from src-tauri/src/db.rs, commands.rs, classifier/train.rs
 // ---------------------------------------------------------------------------
 
 export interface AppInfo {
@@ -11,6 +11,7 @@ export interface AppInfo {
   default_threads: number;
   max_workers: number;
   formats: string[];
+  models_dir: string;
 }
 
 export interface JobProgress {
@@ -149,6 +150,8 @@ export interface AgreementStats {
 
 export interface ClassifierRunInfo {
   id: number;
+  mode: "score" | "eval";
+  model_row_id: number | null;
   session_id: number | null;
   session_name: string | null;
   backend: string;
@@ -164,6 +167,127 @@ export interface ClassifierRunInfo {
   finished_at: string | null;
   error: string | null;
   agreement: AgreementStats | null;
+  evaluated: number;
+  eval_agree: number;
+}
+
+export interface EvalBrief {
+  run_id: number;
+  evaluated: number;
+  agree: number;
+  pending: number;
+}
+
+export interface HeadMetrics {
+  n_train: number;
+  n_holdout: number;
+  positives?: number;
+  tp: number;
+  fp: number;
+  tn: number;
+  fn_: number;
+  accuracy: number | null;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
+}
+
+export interface TrainMetrics {
+  rows: number;
+  labelled: number;
+  good: number;
+  bad: number;
+  feedback_rows: number;
+  warm_start: boolean;
+  epochs?: number;
+  verdict: HeadMetrics;
+  tags: { name: string; count: number; metrics: HeadMetrics }[];
+  elapsed_ms?: number;
+  log_tail?: string[];
+}
+
+export interface ModelInfo {
+  id: number;
+  name: string;
+  kind: "builtin" | "external";
+  path: string;
+  command: string | null;
+  parent_id: number | null;
+  parent_name: string | null;
+  created_at: string;
+  train_rows: number;
+  metrics: Partial<TrainMetrics> | null;
+  tag_names: string[];
+  notes: string | null;
+  runs: number;
+  latest_eval: EvalBrief | null;
+}
+
+export interface EvalFeedbackView {
+  run_id: number;
+  sample_id: number;
+  predicted: string;
+  score: number;
+  predicted_tags: string[];
+  human: string;
+  human_tags: string[];
+  agree: boolean;
+  blind: boolean;
+  created_at: string;
+}
+
+export interface CalibrationBin {
+  lo: number;
+  hi: number;
+  n: number;
+  agree: number;
+}
+
+export interface TagAgreement {
+  name: string;
+  predicted: number;
+  human: number;
+  both: number;
+}
+
+export interface Disagreement {
+  sample_id: number;
+  session_id: number;
+  rel_path: string;
+  predicted: string;
+  score: number;
+  human: string;
+  preview: string;
+}
+
+export interface EvalReport {
+  run_id: number;
+  model_row_id: number | null;
+  model_name: string;
+  scored: number;
+  remaining: number;
+  evaluated: number;
+  agree: number;
+  blind: number;
+  tp: number;
+  fp: number;
+  tn: number;
+  fn_: number;
+  accuracy: number | null;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
+  calibration: CalibrationBin[];
+  tags: TagAgreement[];
+  disagreements: Disagreement[];
+  gate_min_accuracy: number;
+  gate_min_evaluated: number;
+  capable: boolean;
+}
+
+export interface DecideResult {
+  counts: StatusCounts;
+  feedback: EvalFeedbackView | null;
 }
 
 export interface ExportStats {
@@ -230,16 +354,49 @@ export interface CreateSessionParams {
 export interface RunParams {
   session_id: number | null;
   only_pending: boolean;
-  backend: "heuristic" | "command";
+  backend: "heuristic" | "command" | "model";
+  model?: number | null;
   command: string;
   args: string[];
   cwd: string | null;
   model_id: string | null;
   workers: number;
   batch_size: number;
+  mode: "score" | "eval";
 }
 
-export type ReviewMode = "pending" | "skip" | "all" | "decided";
+export interface BuiltinTrainOptions {
+  name: string;
+  session_ids: number[];
+  human_only: boolean;
+  holdout: number;
+  min_tag_count: number;
+  epochs: number;
+  parent_model: number | null;
+  feedback_weight: number;
+  seed: number;
+  notes: string | null;
+}
+
+export interface ExternalTrainOptions {
+  name: string;
+  session_ids: number[];
+  human_only: boolean;
+  command_template: string;
+  cwd: string | null;
+  worker_template: string;
+  model_ext: string;
+  parent_model: number | null;
+  notes: string | null;
+}
+
+export interface TrainParams {
+  trainer: "builtin" | "external";
+  builtin?: BuiltinTrainOptions;
+  external?: ExternalTrainOptions;
+}
+
+export type ReviewMode = "pending" | "skip" | "all" | "decided" | "eval";
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -265,11 +422,11 @@ export const api = {
   renameSession: (session_id: number, name: string) => invoke<void>("rename_session", { session_id, name }),
   sessionCounts: (session_id: number) => invoke<StatusCounts>("session_counts", { session_id }),
 
-  nextSample: (session_id: number, mode: ReviewMode, after_ordinal: number | null) =>
-    invoke<SampleView | null>("next_sample", { session_id, mode, after_ordinal }),
-  getSample: (sample_id: number) => invoke<SampleView>("get_sample", { sample_id }),
-  decideSample: (sample_id: number, verdict: "good" | "bad" | "skip" | "pending", view_ms: number | null) =>
-    invoke<StatusCounts>("decide_sample", { sample_id, verdict, view_ms }),
+  nextSample: (session_id: number, mode: ReviewMode, after_ordinal: number | null, run_id: number | null = null) =>
+    invoke<SampleView | null>("next_sample", { session_id, mode, after_ordinal, run_id }),
+  getSample: (sample_id: number, run_id: number | null = null) => invoke<SampleView>("get_sample", { sample_id, run_id }),
+  decideSample: (sample_id: number, verdict: "good" | "bad" | "skip" | "pending", view_ms: number | null, eval_run_id: number | null = null, blind = true) =>
+    invoke<DecideResult>("decide_sample", { sample_id, verdict, view_ms, eval_run_id, blind }),
   setSampleTag: (sample_id: number, tag_id: number, on: boolean) =>
     invoke<number[]>("set_sample_tag", { sample_id, tag_id, on }),
   listSamples: (session_id: number | null, statuses: string[], limit = 200, offset = 0) =>
@@ -285,8 +442,12 @@ export const api = {
   openFile: (file_id: number) => invoke<string>("open_file", { file_id }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
 
+  listModels: () => invoke<ModelInfo[]>("list_models"),
+  deleteModel: (model_id: number, delete_file: boolean) => invoke<void>("delete_model", { model_id, delete_file }),
+  trainModel: (params: TrainParams) => invoke<StartedJob>("train_model", { params }),
   startClassifierRun: (params: RunParams) => invoke<StartedJob>("start_classifier_run", { params }),
   listClassifierRuns: () => invoke<ClassifierRunInfo[]>("list_classifier_runs"),
+  evalReport: (run_id: number) => invoke<EvalReport>("eval_report", { run_id }),
   applyRunPredictions: (run_id: number, min_score: number, apply_tags: boolean) =>
     invoke<number>("apply_run_predictions", { run_id, min_score, apply_tags }),
   deleteClassifierRun: (run_id: number) => invoke<void>("delete_classifier_run", { run_id }),

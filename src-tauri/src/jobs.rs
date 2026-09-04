@@ -174,6 +174,10 @@ impl JobHandle {
         self.update(false, |p| p.payload = payload);
     }
 
+    pub fn payload(&self) -> Option<serde_json::Value> {
+        self.jobs.inner.lock().unwrap().get(&self.id).map(|e| e.progress.payload.clone())
+    }
+
     pub fn finish(&self, status: &str, message: impl Into<String>) {
         let message = message.into();
         let status = status.to_string();

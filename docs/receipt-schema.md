@@ -137,3 +137,13 @@ sample text was normalised: CRLF → LF, trailing newline stripped, and cut at
 ```
 
 `label` is `1` for good, `0` for bad, `null` for skipped / pending rows.
+
+After an evaluation round each row also carries `eval` (or `null`):
+
+```json
+"eval": { "run_id": 7, "predicted": "bad", "score": 0.82, "predicted_tags": ["boilerplate"],
+          "human": "good", "agree": false, "blind": true }
+```
+
+`agree: false` rows are the model's mistakes on unseen data; trainers should
+up-weight them (both reference trainers do, `--feedback-weight`).

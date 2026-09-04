@@ -1,5 +1,5 @@
-import { api, type SampleView, type SessionInfo, type StatusCounts, type ReviewMode } from "../api";
-import { h, clear, fmtBytes, fmtInt, toast, guard, on, statusBar } from "../ui";
+import { api, type SampleView, type SessionInfo, type StatusCounts, type ReviewMode, type EvalFeedbackView, type EvalReport } from "../api";
+import { h, clear, fmtBytes, fmtInt, fmtPct, toast, guard, on, statusBar } from "../ui";
 import { state, setSession, refreshTags, navigate, type View } from "../state";
 
 let root: HTMLElement;
@@ -15,6 +15,13 @@ let wrap = true;
 let busy = false;
 let unsubs: (() => void)[] = [];
 
+// Evaluation mode: walking the pending samples a classifier run scored,
+// deciding blind, then seeing whether the model agreed.
+let evalRunId: number | null = null;
+let blind = true;
+let lastFeedback: EvalFeedbackView | null = null;
+let evalReport: EvalReport | null = null;
+
 // Elements re-rendered independently.
 let topEl: HTMLElement;
 let bodyEl: HTMLElement;
@@ -24,12 +31,24 @@ function session(): SessionInfo | undefined {
   return sessions.find((s) => s.id === sessionId);
 }
 
+function isEval(): boolean {
+  return mode === "eval" && evalRunId !== null;
+}
+
 async function refreshCounts() {
+  if (isEval()) {
+    evalReport = (await guard(api.evalReport(evalRunId!))) ?? evalReport;
+  }
   if (!sessionId) return;
   counts = (await guard(api.sessionCounts(sessionId))) ?? counts;
 }
 
 async function loadNext(afterOrdinal: number | null) {
+  if (isEval()) {
+    current = (await guard(api.nextSample(sessionId ?? 0, "eval", afterOrdinal, evalRunId), "next sample")) ?? null;
+    shownAt = Date.now();
+    return;
+  }
   if (!sessionId) {
     current = null;
     return;
@@ -39,7 +58,7 @@ async function loadNext(afterOrdinal: number | null) {
 }
 
 async function show(id: number) {
-  current = (await guard(api.getSample(id), "load sample")) ?? null;
+  current = (await guard(api.getSample(id, isEval() ? evalRunId : null), "load sample")) ?? null;
   shownAt = Date.now();
 }
 
@@ -50,8 +69,16 @@ async function decide(verdict: "good" | "bad" | "skip") {
   const viewMs = Date.now() - shownAt;
   const card = bodyEl.querySelector(".sample-card");
   card?.classList.add(verdict === "bad" ? "swipe-left" : verdict === "good" ? "swipe-right" : "swipe-down");
-  const res = await guard(api.decideSample(s.id, verdict, viewMs), "save decision");
-  if (res) counts = res;
+  const res = await guard(api.decideSample(s.id, verdict, viewMs, isEval() ? evalRunId : null, blind), "save decision");
+  if (res) {
+    counts = res.counts;
+    lastFeedback = res.feedback;
+    if (isEval() && evalRunId !== null) evalReport = (await guard(api.evalReport(evalRunId))) ?? evalReport;
+    if (sessionId !== s.session_id) {
+      sessionId = s.session_id;
+      counts = (await guard(api.sessionCounts(sessionId))) ?? counts;
+    }
+  }
   if (history[history.length - 1] !== s.id) history.push(s.id);
   if (history.length > 500) history.shift();
   await new Promise((r) => setTimeout(r, 150));
@@ -98,6 +125,27 @@ async function addTag(name: string) {
 
 function renderTop() {
   clear(topEl);
+  if (isEval()) {
+    const r = evalReport;
+    topEl.appendChild(h("div", { style: { display: "contents" } },
+      h("span", { class: "pill accent" }, "evaluation"),
+      h("b", null, r ? r.model_name : `run #${evalRunId}`),
+      h("span", { class: "small muted" }, `run #${evalRunId}`),
+      r
+        ? h("div", { class: "review-counts" },
+            h("span", null, h("b", null, fmtInt(r.evaluated)), " evaluated"),
+            h("span", null, h("b", { style: { color: "var(--good)" } }, r.evaluated ? fmtPct(r.agree, r.evaluated) : "–"), " agreement"),
+            h("span", null, h("b", null, fmtInt(r.remaining)), " remaining"),
+            r.capable ? h("span", { class: "pill good" }, "meets gate") : h("span", { class: "pill" }, `gate ${Math.round(r.gate_min_accuracy * 100)}% / n≥${r.gate_min_evaluated}`),
+          )
+        : null,
+      h("span", { style: { flex: "1" } }),
+      h("button", { class: `sm ${blind ? "" : "ghost"}`, title: "Hide the model's prediction until you have decided (recommended for honest evaluation)", onClick: () => { blind = !blind; renderBody(); renderTop(); } }, blind ? "Blind ✓" : "Blind off"),
+      h("button", { class: "sm", onClick: () => navigate("classifier", { runId: evalRunId }) }, "Report"),
+      h("button", { class: "sm ghost", onClick: async () => { evalRunId = null; mode = "pending"; lastFeedback = null; history = []; await refreshCounts(); await loadNext(null); renderAll(); } }, "Exit evaluation"),
+    ));
+    return;
+  }
   const sel = h(
     "select",
     { onChange: async () => { sessionId = Number(sel.value) || null; setSession(sessionId); history = []; await refreshCounts(); await loadNext(null); renderAll(); } },
@@ -169,6 +217,30 @@ function renderContent(s: SampleView): HTMLElement {
   return h("pre", { class: `sample-text ${wrap ? "" : "nowrap"}` }, s.text);
 }
 
+function predictionBlock(s: SampleView): HTMLElement | null {
+  if (!s.prediction) return null;
+  if (isEval() && blind) {
+    return h("div", { class: "prediction" }, h("span", { class: "who" }, "model prediction hidden until you decide (blind evaluation)"));
+  }
+  const p = s.prediction;
+  return h("div", { class: "prediction" },
+    h("span", { class: "who" }, `model ${p.model_id}:`),
+    h("span", { class: `pill ${p.verdict === "good" ? "good" : p.verdict === "bad" ? "bad" : ""}` }, `${p.verdict} ${(100 * p.score).toFixed(0)}%`),
+    ...p.tags.map((t) => h("span", { class: "pill" }, t)),
+    p.tags.length
+      ? h("button", { class: "ghost sm", onClick: async () => {
+          for (const name of p.tags) {
+            const tag = state.tags.find((t) => t.name === name);
+            const id = tag ? tag.id : await guard(api.createTag(name));
+            if (id !== undefined && !s.tags.includes(id)) s.tags = (await guard(api.setSampleTag(s.id, id, true))) ?? s.tags;
+          }
+          await refreshTags();
+          renderTags();
+        } }, "use tags")
+      : null,
+  );
+}
+
 function renderBody() {
   clear(bodyEl);
   const s = current;
@@ -176,7 +248,13 @@ function renderBody() {
     const c = counts;
     bodyEl.appendChild(
       h("div", { class: "empty", style: { gridColumn: "1 / -1", alignSelf: "start" } },
-        sessionId ? h("div", null, h("div", { style: { fontSize: "16px", marginBottom: "8px" } }, mode === "pending" ? "No pending samples left in this session." : mode === "skip" ? "The skip queue is empty." : "Nothing here."),
+        isEval()
+          ? h("div", null,
+              h("div", { style: { fontSize: "16px", marginBottom: "8px" } }, "Every sample this run scored has been evaluated."),
+              h("div", { class: "row", style: { justifyContent: "center" } },
+                h("button", { class: "primary", onClick: () => navigate("classifier", { runId: evalRunId }) }, "Open the evaluation report"),
+              ))
+          : sessionId ? h("div", null, h("div", { style: { fontSize: "16px", marginBottom: "8px" } }, mode === "pending" ? "No pending samples left in this session." : mode === "skip" ? "The skip queue is empty." : "Nothing here."),
           h("div", { class: "row", style: { justifyContent: "center" } },
             c && c.skip > 0 && mode !== "skip" ? h("button", { onClick: async () => { mode = "skip"; await loadNext(null); renderAll(); } }, `Review ${c.skip} skipped`) : null,
             h("button", { onClick: () => navigate("sessions") }, "Sessions"),
@@ -188,24 +266,6 @@ function renderBody() {
     return;
   }
   const status = s.status !== "pending" ? h("span", { class: `status-banner ${s.status}` }, `already marked ${s.status}${s.decided_by ? ` by ${s.decided_by}` : ""} — deciding again overrides`) : null;
-  const pred = s.prediction
-    ? h("div", { class: "prediction" },
-        h("span", { class: "who" }, `model ${s.prediction.model_id}:`),
-        h("span", { class: `pill ${s.prediction.verdict === "good" ? "good" : s.prediction.verdict === "bad" ? "bad" : ""}` }, `${s.prediction.verdict} ${(100 * s.prediction.score).toFixed(0)}%`),
-        ...s.prediction.tags.map((t) => h("span", { class: "pill" }, t)),
-        s.prediction.tags.length
-          ? h("button", { class: "ghost sm", onClick: async () => {
-              for (const name of s.prediction!.tags) {
-                const tag = state.tags.find((t) => t.name === name);
-                const id = tag ? tag.id : await guard(api.createTag(name));
-                if (id !== undefined && !s.tags.includes(id)) s.tags = (await guard(api.setSampleTag(s.id, id, true))) ?? s.tags;
-              }
-              await refreshTags();
-              renderTags();
-            } }, "use tags")
-          : null,
-      )
-    : null;
   const card = h("div", { class: "sample-card enter" },
     h("div", { class: "sample-head" },
       h("div", { class: "sample-path", title: "Reveal in Explorer", onClick: () => guard(api.revealFile(s.file_id), "reveal") }, s.abs_path),
@@ -220,7 +280,7 @@ function renderBody() {
         h("span", { class: "pill" }, `#${s.ordinal + 1}`),
         status,
       ),
-      pred,
+      predictionBlock(s),
     ),
     renderContent(s),
   );
@@ -264,10 +324,22 @@ function renderTags() {
   );
 }
 
+function feedbackBanner(): HTMLElement | null {
+  const f = lastFeedback;
+  if (!isEval() || !f) return null;
+  const cls = f.human === "skip" ? "skip" : f.agree ? "good" : "bad";
+  const text = f.human === "skip"
+    ? `Previous: skipped · model said ${f.predicted} (${Math.round(f.score * 100)}%)`
+    : `Previous: you said ${f.human} · model said ${f.predicted} (${Math.round(f.score * 100)}%) → ${f.agree ? "agreement" : "DISAGREEMENT"}`;
+  const tagNote = f.predicted_tags.length || f.human_tags.length ? ` · tags model ${f.predicted_tags.join(",") || "–"} / you ${f.human_tags.join(",") || "–"}` : "";
+  return h("span", { class: `status-banner ${cls}`, style: { width: "100%", textAlign: "center" } }, text + tagNote);
+}
+
 function renderActions() {
   clear(actionsEl);
   const has = !!current;
-  actionsEl.append(
+  actionsEl.appendChild(h("div", { style: { display: "contents" } },
+    feedbackBanner(),
     h("button", { disabled: history.length === 0, onClick: prev, title: "Backspace / ←" }, "◀ Prev"),
     h("span", { class: "spacer" }),
     h("button", { class: "btn-bad", disabled: !has, onClick: () => decide("bad") }, h("kbd", null, "−"), " Bad"),
@@ -277,7 +349,7 @@ function renderActions() {
     h("button", { disabled: !has, onClick: () => guard(api.revealFile(current!.file_id), "reveal"), title: "Open Explorer at the file so you can edit it safely outside GCCF" }, "Reveal file"),
     h("button", { disabled: !has, onClick: () => guard(api.openFile(current!.file_id), "open"), title: "Open with the default application" }, "Open"),
     h("button", { disabled: !has, onClick: next, title: "→ (peek without deciding)" }, "Next ▶"),
-  );
+  ));
 }
 
 function renderAll() {
@@ -292,11 +364,20 @@ export const reviewView: View = {
     unsubs.forEach((u) => u());
     unsubs = [];
     sessions = (await guard(api.listSessions(), "sessions")) ?? [];
-    if (params?.sessionId) setSession(params.sessionId);
-    if (params?.mode) mode = params.mode;
+    if (params?.mode === "eval" && params?.runId) {
+      evalRunId = params.runId;
+      mode = "eval";
+      lastFeedback = null;
+      evalReport = null;
+    } else {
+      if (params?.sessionId) setSession(params.sessionId);
+      if (params?.mode) mode = params.mode;
+      if (mode === "eval") mode = "pending";
+      evalRunId = null;
+    }
     sessionId = state.sessionId;
     if (sessionId && !sessions.some((s) => s.id === sessionId && s.status === "ready")) sessionId = null;
-    if (!sessionId) {
+    if (!sessionId && !isEval()) {
       const first = sessions.find((s) => s.status === "ready" && s.counts.pending > 0) ?? sessions.find((s) => s.status === "ready");
       sessionId = first?.id ?? null;
       setSession(sessionId);

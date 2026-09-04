@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const BUILTIN_TAGS: &[&str] = &[
     "code",
@@ -79,12 +79,14 @@ impl Db {
     fn migrate(&self) -> Result<()> {
         let conn = self.lock();
         conn.execute_batch(SCHEMA)?;
+        ensure_column(&conn, "classifier_runs", "model_row_id", "INTEGER")?;
+        ensure_column(&conn, "classifier_runs", "mode", "TEXT NOT NULL DEFAULT 'score'")?;
         let v: i64 = conn
             .query_row("SELECT value FROM settings WHERE key = 'schema_version'", [], |r| r.get::<_, String>(0))
             .optional()?
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        if v == 0 {
+        if v < SCHEMA_VERSION {
             conn.execute(
                 "INSERT OR REPLACE INTO settings(key, value) VALUES('schema_version', ?1)",
                 params![SCHEMA_VERSION.to_string()],
@@ -100,6 +102,20 @@ impl Db {
         }
         Ok(())
     }
+}
+
+/// Add a column to an existing table if it is missing (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`).
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == column);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
+    Ok(())
 }
 
 const SCHEMA: &str = r#"
@@ -234,6 +250,36 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 CREATE INDEX IF NOT EXISTS predictions_sample ON predictions(sample_id, id);
 CREATE INDEX IF NOT EXISTS predictions_run ON predictions(run_id);
+
+CREATE TABLE IF NOT EXISTS models (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  command TEXT,
+  parent_id INTEGER REFERENCES models(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  train_rows INTEGER NOT NULL DEFAULT 0,
+  metrics_json TEXT,
+  tag_names_json TEXT,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS eval_feedback (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES classifier_runs(id) ON DELETE CASCADE,
+  sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+  predicted TEXT NOT NULL,
+  score REAL NOT NULL,
+  predicted_tags_json TEXT NOT NULL,
+  human TEXT NOT NULL,
+  human_tags_json TEXT NOT NULL,
+  blind INTEGER NOT NULL DEFAULT 1,
+  view_ms INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, sample_id)
+);
+CREATE INDEX IF NOT EXISTS eval_feedback_sample ON eval_feedback(sample_id);
 "#;
 
 // ---------------------------------------------------------------------------
@@ -387,6 +433,8 @@ pub struct TagInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifierRunInfo {
     pub id: i64,
+    pub mode: String,
+    pub model_row_id: Option<i64>,
     pub session_id: Option<i64>,
     pub session_name: Option<String>,
     pub backend: String,
@@ -402,6 +450,8 @@ pub struct ClassifierRunInfo {
     pub finished_at: Option<String>,
     pub error: Option<String>,
     pub agreement: Option<AgreementStats>,
+    pub evaluated: i64,
+    pub eval_agree: i64,
 }
 
 /// How predictions line up with human decisions on the same samples.
@@ -1104,6 +1154,7 @@ pub fn set_sample_tag(conn: &Connection, sample_id: i64, tag_id: i64, on: bool, 
 // Classifier runs & predictions
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_run(
     conn: &Connection,
     session_id: Option<i64>,
@@ -1113,11 +1164,13 @@ pub fn insert_run(
     workers: i64,
     batch_size: i64,
     total: i64,
+    model_row_id: Option<i64>,
+    mode: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO classifier_runs(session_id, backend, model_id, command, workers, batch_size, status, total, started_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
-        params![session_id, backend, model_id, command, workers, batch_size, total, now_iso()],
+        "INSERT INTO classifier_runs(session_id, backend, model_id, command, workers, batch_size, status, total, started_at, model_row_id, mode)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10)",
+        params![session_id, backend, model_id, command, workers, batch_size, total, now_iso(), model_row_id, mode],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1193,12 +1246,18 @@ pub fn latest_prediction(conn: &Connection, sample_id: i64) -> rusqlite::Result<
 pub fn list_runs(conn: &Connection) -> Result<Vec<ClassifierRunInfo>> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.session_id, s.name, r.backend, r.model_id, r.command, r.workers, r.batch_size, r.status, r.total, r.completed, r.failed,
-                r.started_at, r.finished_at, r.error
+                r.started_at, r.finished_at, r.error, r.mode, r.model_row_id,
+                (SELECT COUNT(*) FROM eval_feedback e WHERE e.run_id = r.id),
+                (SELECT COUNT(*) FROM eval_feedback e WHERE e.run_id = r.id AND e.predicted = e.human)
          FROM classifier_runs r LEFT JOIN sessions s ON s.id = r.session_id ORDER BY r.id DESC LIMIT 200",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(ClassifierRunInfo {
             id: r.get(0)?,
+            mode: r.get::<_, Option<String>>(15)?.unwrap_or_else(|| "score".into()),
+            model_row_id: r.get(16)?,
+            evaluated: r.get(17)?,
+            eval_agree: r.get(18)?,
             session_id: r.get(1)?,
             session_name: r.get(2)?,
             backend: r.get(3)?,
@@ -1351,6 +1410,9 @@ pub struct ExportSampleRow {
     pub text: String,
     pub text_bytes: i64,
     pub truncated: bool,
+    /// Most recent evaluation feedback on this sample, if a model was
+    /// evaluated against it (what it predicted vs. what the human said).
+    pub eval: Option<EvalFeedbackView>,
 }
 
 /// Stream samples (with their tags) through a callback, in ordinal order.
@@ -1403,11 +1465,448 @@ where
             text: r.get(13)?,
             text_bytes: r.get(14)?,
             truncated: r.get::<_, i64>(15)? != 0,
+            eval: latest_eval_feedback(conn, id)?,
         };
         f(row)?;
         n += 1;
     }
     Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// Models (trained classifiers)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: i64,
+    pub name: String,
+    /// "builtin" (served in-process) | "external" (served by `command`)
+    pub kind: String,
+    pub path: String,
+    pub command: Option<String>,
+    pub parent_id: Option<i64>,
+    pub parent_name: Option<String>,
+    pub created_at: String,
+    pub train_rows: i64,
+    pub metrics: serde_json::Value,
+    pub tag_names: Vec<String>,
+    pub notes: Option<String>,
+    pub runs: i64,
+    /// Latest evaluation run of this model, if any.
+    pub latest_eval: Option<EvalBrief>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalBrief {
+    pub run_id: i64,
+    pub evaluated: i64,
+    pub agree: i64,
+    pub pending: i64,
+}
+
+pub struct NewModel<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub path: &'a str,
+    pub command: Option<&'a str>,
+    pub parent_id: Option<i64>,
+    pub train_rows: i64,
+    pub metrics: &'a serde_json::Value,
+    pub tag_names: &'a [String],
+    pub notes: Option<&'a str>,
+}
+
+pub fn insert_model(conn: &Connection, m: &NewModel<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO models(name, kind, path, command, parent_id, created_at, train_rows, metrics_json, tag_names_json, notes)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            m.name,
+            m.kind,
+            m.path,
+            m.command,
+            m.parent_id,
+            now_iso(),
+            m.train_rows,
+            serde_json::to_string(m.metrics)?,
+            serde_json::to_string(m.tag_names)?,
+            m.notes
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn model_from(conn: &Connection, r: &Row<'_>) -> rusqlite::Result<ModelInfo> {
+    let id: i64 = r.get(0)?;
+    let metrics: Option<String> = r.get(8)?;
+    let tags: Option<String> = r.get(9)?;
+    let latest_eval = conn
+        .query_row(
+            "SELECT r.id,
+                    (SELECT COUNT(*) FROM eval_feedback e WHERE e.run_id = r.id AND e.human != 'skip'),
+                    (SELECT COUNT(*) FROM eval_feedback e WHERE e.run_id = r.id AND e.predicted = e.human),
+                    (SELECT COUNT(*) FROM predictions p JOIN samples s ON s.id = p.sample_id WHERE p.run_id = r.id AND s.status = 'pending')
+             FROM classifier_runs r WHERE r.model_row_id = ?1 AND r.mode = 'eval' ORDER BY r.id DESC LIMIT 1",
+            params![id],
+            |r| {
+                Ok(EvalBrief {
+                    run_id: r.get(0)?,
+                    evaluated: r.get(1)?,
+                    agree: r.get(2)?,
+                    pending: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(ModelInfo {
+        id,
+        name: r.get(1)?,
+        kind: r.get(2)?,
+        path: r.get(3)?,
+        command: r.get(4)?,
+        parent_id: r.get(5)?,
+        parent_name: r.get(6)?,
+        created_at: r.get(7)?,
+        metrics: metrics.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(serde_json::Value::Null),
+        tag_names: tags.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
+        train_rows: r.get(10)?,
+        notes: r.get(11)?,
+        runs: r.get(12)?,
+        latest_eval,
+    })
+}
+
+const MODEL_SELECT: &str = "SELECT m.id, m.name, m.kind, m.path, m.command, m.parent_id, p.name, m.created_at, m.metrics_json, m.tag_names_json, m.train_rows, m.notes,
+        (SELECT COUNT(*) FROM classifier_runs r WHERE r.model_row_id = m.id)
+        FROM models m LEFT JOIN models p ON p.id = m.parent_id";
+
+pub fn list_models(conn: &Connection) -> Result<Vec<ModelInfo>> {
+    let mut stmt = conn.prepare(&format!("{MODEL_SELECT} ORDER BY m.id DESC"))?;
+    let rows = stmt.query_map([], |r| model_from(conn, r))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn get_model(conn: &Connection, id: i64) -> Result<ModelInfo> {
+    let mut stmt = conn.prepare(&format!("{MODEL_SELECT} WHERE m.id = ?1"))?;
+    stmt.query_row(params![id], |r| model_from(conn, r))
+        .optional()?
+        .ok_or_else(|| GccfError::msg(format!("model {id} not found")))
+}
+
+pub fn delete_model(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM models WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation feedback
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalFeedbackView {
+    pub run_id: i64,
+    pub sample_id: i64,
+    pub predicted: String,
+    pub score: f64,
+    pub predicted_tags: Vec<String>,
+    pub human: String,
+    pub human_tags: Vec<String>,
+    pub agree: bool,
+    pub blind: bool,
+    pub created_at: String,
+}
+
+pub fn prediction_for_run(conn: &Connection, run_id: i64, sample_id: i64) -> rusqlite::Result<Option<PredictionView>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.run_id, r.model_id, p.verdict, p.score, p.tags_json, p.created_at
+         FROM predictions p JOIN classifier_runs r ON r.id = p.run_id
+         WHERE p.run_id = ?1 AND p.sample_id = ?2 ORDER BY p.id DESC LIMIT 1",
+    )?;
+    stmt.query_row(params![run_id, sample_id], |r| {
+        let tags_json: String = r.get(4)?;
+        Ok(PredictionView {
+            run_id: r.get(0)?,
+            model_id: r.get(1)?,
+            verdict: r.get(2)?,
+            score: r.get(3)?,
+            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            created_at: r.get(5)?,
+        })
+    })
+    .optional()
+}
+
+/// Next sample to evaluate for a run: still pending, has a prediction from
+/// this run, ordered by ordinal. The returned view carries *this run's*
+/// prediction rather than the latest one.
+pub fn next_eval_sample(conn: &Connection, run_id: i64, after_ordinal: Option<i64>) -> Result<Option<SampleView>> {
+    let base = format!(
+        "{SAMPLE_SELECT} WHERE s.status = 'pending' AND EXISTS (SELECT 1 FROM predictions p WHERE p.run_id = ?1 AND p.sample_id = s.id)"
+    );
+    let mut found: Option<SampleView> = None;
+    if let Some(after) = after_ordinal {
+        let mut stmt = conn.prepare_cached(&format!("{base} AND s.ordinal > ?2 ORDER BY s.session_id, s.ordinal LIMIT 1"))?;
+        found = stmt.query_row(params![run_id, after], |r| sample_view_from(conn, r)).optional()?;
+    }
+    if found.is_none() {
+        let mut stmt = conn.prepare_cached(&format!("{base} ORDER BY s.session_id, s.ordinal LIMIT 1"))?;
+        found = stmt.query_row(params![run_id], |r| sample_view_from(conn, r)).optional()?;
+    }
+    if let Some(v) = found.as_mut() {
+        v.prediction = prediction_for_run(conn, run_id, v.id)?;
+    }
+    Ok(found)
+}
+
+/// Record what the human decided about a sample that a run had predicted.
+/// Returns `None` when the run never scored this sample.
+pub fn insert_eval_feedback(conn: &Connection, run_id: i64, sample_id: i64, human: &str, blind: bool, view_ms: Option<i64>) -> Result<Option<EvalFeedbackView>> {
+    let Some(pred) = prediction_for_run(conn, run_id, sample_id)? else {
+        return Ok(None);
+    };
+    let human_tags = sample_tag_names(conn, sample_id)?;
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO eval_feedback(run_id, sample_id, predicted, score, predicted_tags_json, human, human_tags_json, blind, view_ms, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(run_id, sample_id) DO UPDATE SET human = excluded.human, human_tags_json = excluded.human_tags_json,
+           blind = excluded.blind, view_ms = excluded.view_ms, created_at = excluded.created_at",
+        params![
+            run_id,
+            sample_id,
+            pred.verdict,
+            pred.score,
+            serde_json::to_string(&pred.tags)?,
+            human,
+            serde_json::to_string(&human_tags)?,
+            blind as i64,
+            view_ms,
+            now
+        ],
+    )?;
+    Ok(Some(EvalFeedbackView {
+        run_id,
+        sample_id,
+        agree: pred.verdict == human,
+        predicted: pred.verdict,
+        score: pred.score,
+        predicted_tags: pred.tags,
+        human: human.to_string(),
+        human_tags,
+        blind,
+        created_at: now,
+    }))
+}
+
+pub fn latest_eval_feedback(conn: &Connection, sample_id: i64) -> rusqlite::Result<Option<EvalFeedbackView>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT run_id, sample_id, predicted, score, predicted_tags_json, human, human_tags_json, blind, created_at
+         FROM eval_feedback WHERE sample_id = ?1 ORDER BY id DESC LIMIT 1",
+    )?;
+    stmt.query_row(params![sample_id], |r| {
+        let pt: String = r.get(4)?;
+        let ht: String = r.get(6)?;
+        let predicted: String = r.get(2)?;
+        let human: String = r.get(5)?;
+        Ok(EvalFeedbackView {
+            run_id: r.get(0)?,
+            sample_id: r.get(1)?,
+            agree: predicted == human,
+            predicted,
+            score: r.get(3)?,
+            predicted_tags: serde_json::from_str(&pt).unwrap_or_default(),
+            human,
+            human_tags: serde_json::from_str(&ht).unwrap_or_default(),
+            blind: r.get::<_, i64>(7)? != 0,
+            created_at: r.get(8)?,
+        })
+    })
+    .optional()
+}
+
+/// sample_id → true when some evaluation of it disagreed with the human.
+/// Used to up-weight hard cases when finetuning.
+pub fn eval_disagreement_samples(conn: &Connection) -> Result<HashMap<i64, bool>> {
+    let mut stmt = conn.prepare(
+        "SELECT sample_id, MIN(CASE WHEN predicted = human THEN 1 ELSE 0 END) FROM eval_feedback WHERE human != 'skip' GROUP BY sample_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? == 0)))?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CalibrationBin {
+    pub lo: f64,
+    pub hi: f64,
+    pub n: i64,
+    pub agree: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TagAgreement {
+    pub name: String,
+    pub predicted: i64,
+    pub human: i64,
+    pub both: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Disagreement {
+    pub sample_id: i64,
+    pub session_id: i64,
+    pub rel_path: String,
+    pub predicted: String,
+    pub score: f64,
+    pub human: String,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvalReport {
+    pub run_id: i64,
+    pub model_row_id: Option<i64>,
+    pub model_name: String,
+    pub scored: i64,
+    pub remaining: i64,
+    pub evaluated: i64,
+    pub agree: i64,
+    pub blind: i64,
+    pub tp: i64,
+    pub fp: i64,
+    pub tn: i64,
+    pub fn_: i64,
+    pub accuracy: Option<f64>,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub f1: Option<f64>,
+    pub calibration: Vec<CalibrationBin>,
+    pub tags: Vec<TagAgreement>,
+    pub disagreements: Vec<Disagreement>,
+    pub gate_min_accuracy: f64,
+    pub gate_min_evaluated: i64,
+    pub capable: bool,
+}
+
+pub fn eval_report(conn: &Connection, run_id: i64, gate_min_accuracy: f64, gate_min_evaluated: i64) -> Result<EvalReport> {
+    let (model_row_id, model_name, scored): (Option<i64>, String, i64) = conn.query_row(
+        "SELECT model_row_id, model_id, (SELECT COUNT(*) FROM predictions p WHERE p.run_id = r.id) FROM classifier_runs r WHERE r.id = ?1",
+        params![run_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM predictions p JOIN samples s ON s.id = p.sample_id WHERE p.run_id = ?1 AND s.status = 'pending'",
+        params![run_id],
+        |r| r.get(0),
+    )?;
+    let mut rep = EvalReport {
+        run_id,
+        model_row_id,
+        model_name,
+        scored,
+        remaining,
+        gate_min_accuracy,
+        gate_min_evaluated,
+        ..Default::default()
+    };
+    let mut bins: Vec<CalibrationBin> = (0..5)
+        .map(|i| CalibrationBin {
+            lo: 0.5 + i as f64 * 0.1,
+            hi: 0.6 + i as f64 * 0.1,
+            ..Default::default()
+        })
+        .collect();
+    let mut tag_stats: HashMap<String, TagAgreement> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT predicted, score, human, blind, predicted_tags_json, human_tags_json FROM eval_feedback WHERE run_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (predicted, score, human, blind, pt, ht) = row?;
+            if human == "skip" {
+                continue; // undecided: no signal
+            }
+            rep.evaluated += 1;
+            rep.blind += blind;
+            let agree = predicted == human;
+            if agree {
+                rep.agree += 1;
+            }
+            match (predicted.as_str(), human.as_str()) {
+                ("good", "good") => rep.tp += 1,
+                ("good", "bad") => rep.fp += 1,
+                ("bad", "bad") => rep.tn += 1,
+                ("bad", "good") => rep.fn_ += 1,
+                _ => {}
+            }
+            let bi = (((score.clamp(0.5, 0.9999) - 0.5) / 0.1) as usize).min(4);
+            bins[bi].n += 1;
+            if agree {
+                bins[bi].agree += 1;
+            }
+            let ptags: Vec<String> = serde_json::from_str(&pt).unwrap_or_default();
+            let htags: Vec<String> = serde_json::from_str(&ht).unwrap_or_default();
+            for t in &ptags {
+                let e = tag_stats.entry(t.clone()).or_insert_with(|| TagAgreement { name: t.clone(), ..Default::default() });
+                e.predicted += 1;
+                if htags.contains(t) {
+                    e.both += 1;
+                }
+            }
+            for t in &htags {
+                let e = tag_stats.entry(t.clone()).or_insert_with(|| TagAgreement { name: t.clone(), ..Default::default() });
+                e.human += 1;
+            }
+        }
+    }
+    if rep.evaluated > 0 {
+        rep.accuracy = Some(rep.agree as f64 / rep.evaluated as f64);
+    }
+    if rep.tp + rep.fp > 0 {
+        rep.precision = Some(rep.tp as f64 / (rep.tp + rep.fp) as f64);
+    }
+    if rep.tp + rep.fn_ > 0 {
+        rep.recall = Some(rep.tp as f64 / (rep.tp + rep.fn_) as f64);
+    }
+    if let (Some(p), Some(r)) = (rep.precision, rep.recall) {
+        if p + r > 0.0 {
+            rep.f1 = Some(2.0 * p * r / (p + r));
+        }
+    }
+    rep.calibration = bins;
+    let mut tags: Vec<TagAgreement> = tag_stats.into_values().collect();
+    tags.sort_by(|a, b| (b.human + b.predicted).cmp(&(a.human + a.predicted)));
+    rep.tags = tags;
+    rep.capable = rep.evaluated >= gate_min_evaluated && rep.accuracy.map(|a| a >= gate_min_accuracy).unwrap_or(false);
+
+    let mut stmt = conn.prepare(
+        "SELECT e.sample_id, s.session_id, f.rel_path, e.predicted, e.score, e.human, substr(s.text, 1, 200)
+         FROM eval_feedback e JOIN samples s ON s.id = e.sample_id JOIN files f ON f.id = s.file_id
+         WHERE e.run_id = ?1 AND e.predicted != e.human AND e.human != 'skip' ORDER BY e.score DESC LIMIT 200",
+    )?;
+    let rows = stmt.query_map(params![run_id], |r| {
+        Ok(Disagreement {
+            sample_id: r.get(0)?,
+            session_id: r.get(1)?,
+            rel_path: r.get(2)?,
+            predicted: r.get(3)?,
+            score: r.get(4)?,
+            human: r.get(5)?,
+            preview: r.get(6)?,
+        })
+    })?;
+    rep.disagreements = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rep)
 }
 
 #[cfg(test)]

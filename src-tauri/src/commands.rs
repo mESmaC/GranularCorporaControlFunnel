@@ -1,6 +1,7 @@
 //! Tauri command surface. Every command is `async` so it runs off the main
 //! thread; long work is handed to a dedicated thread and tracked as a job.
 
+use crate::classifier::train::{ExternalTrainOptions, TrainOptions};
 use crate::classifier::{self, BackendSpec, ClassifyItem};
 use crate::db::{self, Db};
 use crate::error::{GccfError, Result};
@@ -27,6 +28,11 @@ pub struct AppInfo {
     pub default_threads: usize,
     pub max_workers: usize,
     pub formats: Vec<String>,
+    pub models_dir: String,
+}
+
+fn models_dir(db: &Db) -> PathBuf {
+    db.path.parent().map(|p| p.join("models")).unwrap_or_else(|| PathBuf::from("models"))
 }
 
 #[derive(Serialize)]
@@ -65,6 +71,7 @@ pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo> {
         default_threads: setting_usize(&state.db, "sample_threads", default_threads()),
         max_workers: classifier::MAX_WORKERS,
         formats: crate::formats::Format::all().iter().map(|f| f.as_str().to_string()).collect(),
+        models_dir: models_dir(&state.db).to_string_lossy().to_string(),
     })
 }
 
@@ -303,22 +310,63 @@ fn statuses_for_mode(mode: &str) -> Vec<&'static str> {
     }
 }
 
+/// `mode = "eval"` walks the still-pending samples scored by `run_id`, in
+/// which case `session_id` is ignored and the view carries that run's
+/// prediction.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn next_sample(state: State<'_, AppState>, session_id: i64, mode: String, after_ordinal: Option<i64>) -> Result<Option<db::SampleView>> {
-    db::next_sample(&state.db.lock(), session_id, &statuses_for_mode(&mode), after_ordinal)
+pub async fn next_sample(
+    state: State<'_, AppState>,
+    session_id: i64,
+    mode: String,
+    after_ordinal: Option<i64>,
+    run_id: Option<i64>,
+) -> Result<Option<db::SampleView>> {
+    let conn = state.db.lock();
+    if mode == "eval" {
+        let run_id = run_id.ok_or_else(|| GccfError::msg("eval mode needs a run_id"))?;
+        return db::next_eval_sample(&conn, run_id, after_ordinal);
+    }
+    db::next_sample(&conn, session_id, &statuses_for_mode(&mode), after_ordinal)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_sample(state: State<'_, AppState>, sample_id: i64) -> Result<db::SampleView> {
-    db::get_sample(&state.db.lock(), sample_id)
+pub async fn get_sample(state: State<'_, AppState>, sample_id: i64, run_id: Option<i64>) -> Result<db::SampleView> {
+    let conn = state.db.lock();
+    let mut v = db::get_sample(&conn, sample_id)?;
+    if let Some(rid) = run_id {
+        v.prediction = db::prediction_for_run(&conn, rid, sample_id)?;
+    }
+    Ok(v)
+}
+
+#[derive(Serialize)]
+pub struct DecideResult {
+    pub counts: db::StatusCounts,
+    /// Present when the decision was made while evaluating a run: what the
+    /// model had predicted and whether the human agreed.
+    pub feedback: Option<db::EvalFeedbackView>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn decide_sample(state: State<'_, AppState>, sample_id: i64, verdict: String, view_ms: Option<i64>) -> Result<db::StatusCounts> {
+pub async fn decide_sample(
+    state: State<'_, AppState>,
+    sample_id: i64,
+    verdict: String,
+    view_ms: Option<i64>,
+    eval_run_id: Option<i64>,
+    blind: Option<bool>,
+) -> Result<DecideResult> {
     let conn = state.db.lock();
     db::decide(&conn, sample_id, &verdict, "human", None, None, view_ms)?;
+    let feedback = match eval_run_id {
+        Some(rid) => db::insert_eval_feedback(&conn, rid, sample_id, &verdict, blind.unwrap_or(true), view_ms)?,
+        None => None,
+    };
     let session_id: i64 = conn.query_row("SELECT session_id FROM samples WHERE id = ?1", [sample_id], |r| r.get(0))?;
-    db::session_counts(&conn, session_id)
+    Ok(DecideResult {
+        counts: db::session_counts(&conn, session_id)?,
+        feedback,
+    })
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -406,16 +454,112 @@ pub async fn reveal_path(app: AppHandle, path: String) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Classifier
+// Classifier: models, training, scoring / evaluation runs
 // ---------------------------------------------------------------------------
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<db::ModelInfo>> {
+    db::list_models(&state.db.lock())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn delete_model(state: State<'_, AppState>, model_id: i64, delete_file: bool) -> Result<()> {
+    let info = db::get_model(&state.db.lock(), model_id)?;
+    db::delete_model(&state.db.lock(), model_id)?;
+    if delete_file {
+        // Only remove artifacts GCCF itself wrote (inside its models dir).
+        let dir = models_dir(&state.db);
+        let p = PathBuf::from(&info.path);
+        if p.starts_with(&dir) {
+            let _ = std::fs::remove_file(&p);
+            if info.kind == "external" {
+                if let Some(stem) = p.file_stem() {
+                    let _ = std::fs::remove_file(dir.join(format!("{}.train.jsonl", stem.to_string_lossy())));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct TrainParams {
+    /// "builtin" | "external"
+    pub trainer: String,
+    pub builtin: Option<TrainOptions>,
+    pub external: Option<ExternalTrainOptions>,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn train_model(app: AppHandle, state: State<'_, AppState>, params: TrainParams) -> Result<StartedJob> {
+    let dir = models_dir(&state.db);
+    std::fs::create_dir_all(&dir)?;
+    let name = match params.trainer.as_str() {
+        "builtin" => params.builtin.as_ref().map(|o| o.name.clone()),
+        "external" => params.external.as_ref().map(|o| o.name.clone()),
+        other => return Err(GccfError::msg(format!("unknown trainer {other}"))),
+    }
+    .ok_or_else(|| GccfError::msg("missing trainer options"))?;
+    let job = state.jobs.start(
+        Some(app),
+        "train",
+        0,
+        &format!("training {}", if name.trim().is_empty() { "model" } else { &name }),
+        serde_json::json!({ "trainer": params.trainer }),
+    );
+    let job_id = job.id;
+    let db = state.db.clone();
+    std::thread::Builder::new()
+        .name("gccf-train".into())
+        .spawn(move || {
+            let result: Result<(i64, serde_json::Value)> = match params.trainer.as_str() {
+                "builtin" => {
+                    let opts = params.builtin.unwrap();
+                    crate::classifier::train::train_builtin(&db, &job, &dir, &opts)
+                        .and_then(|(id, m)| Ok((id, serde_json::to_value(m)?)))
+                }
+                _ => {
+                    let opts = params.external.unwrap();
+                    crate::classifier::train::train_external(&db, &job, &dir, &opts)
+                        .and_then(|id| Ok((id, db::get_model(&db.lock(), id)?.metrics)))
+                }
+            };
+            match result {
+                Ok((model_id, metrics)) => {
+                    let mut payload = job_payload_log(&job);
+                    payload["model_id"] = serde_json::json!(model_id);
+                    payload["metrics"] = metrics;
+                    job.finish_with_payload("done", format!("model #{model_id} ready"), payload);
+                }
+                Err(e) => {
+                    let status = if e.to_string().contains("cancelled") { "cancelled" } else { "error" };
+                    job.finish(status, e.to_string());
+                }
+            }
+        })
+        .expect("spawn train thread");
+    Ok(StartedJob {
+        job_id,
+        root_id: None,
+        session_id: None,
+        run_id: None,
+    })
+}
+
+/// Keep the external trainer's log when finishing the job.
+fn job_payload_log(job: &crate::jobs::JobHandle) -> serde_json::Value {
+    job.payload().unwrap_or_else(|| serde_json::json!({}))
+}
 
 #[derive(Deserialize)]
 pub struct RunParams {
     pub session_id: Option<i64>,
     #[serde(default = "default_true")]
     pub only_pending: bool,
-    /// "heuristic" | "command"
+    /// "heuristic" | "command" | "model"
     pub backend: String,
+    /// For backend = "model": row id in the models table.
+    pub model: Option<i64>,
     #[serde(default)]
     pub command: String,
     #[serde(default)]
@@ -424,10 +568,15 @@ pub struct RunParams {
     pub model_id: Option<String>,
     pub workers: Option<usize>,
     pub batch_size: Option<usize>,
+    /// "score" (default) records predictions for hints / bulk apply;
+    /// "eval" records them for blind human evaluation.
+    pub mode: Option<String>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn start_classifier_run(app: AppHandle, state: State<'_, AppState>, params: RunParams) -> Result<StartedJob> {
+    let mut model_row_id: Option<i64> = None;
+    let mut provenance: Option<String> = params.model_id.clone().filter(|m| !m.trim().is_empty());
     let spec = match params.backend.as_str() {
         "heuristic" => BackendSpec::Heuristic,
         "command" => {
@@ -440,29 +589,43 @@ pub async fn start_classifier_run(app: AppHandle, state: State<'_, AppState>, pa
                 cwd: params.cwd.clone(),
             }
         }
+        "model" => {
+            let id = params.model.ok_or_else(|| GccfError::msg("choose a model"))?;
+            let info = db::get_model(&state.db.lock(), id)?;
+            model_row_id = Some(info.id);
+            provenance = Some(format!("{}#{}", info.name, info.id));
+            match info.kind.as_str() {
+                "builtin" => BackendSpec::Builtin { path: info.path.clone() },
+                _ => BackendSpec::Command {
+                    command: info.command.clone().unwrap_or_default(),
+                    args: Vec::new(),
+                    cwd: params.cwd.clone(),
+                },
+            }
+        }
         other => return Err(GccfError::msg(format!("unknown backend {other}"))),
     };
-    let model_id = params
-        .model_id
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| match &spec {
-            BackendSpec::Heuristic => "heuristic-v1".into(),
-            BackendSpec::Command { command, .. } => {
-                // last token that looks like a model path, else the command itself
-                command
-                    .split_whitespace()
-                    .filter(|t| t.contains('.') && !t.ends_with(".py"))
-                    .last()
-                    .unwrap_or(command)
-                    .to_string()
-            }
-        });
+    let model_id = provenance.unwrap_or_else(|| match &spec {
+        BackendSpec::Heuristic => "heuristic-v1".into(),
+        BackendSpec::Builtin { path } => path.clone(),
+        BackendSpec::Command { command, .. } => command
+            .split_whitespace()
+            .filter(|t| t.contains('.') && !t.ends_with(".py"))
+            .last()
+            .unwrap_or(command)
+            .trim_matches('"')
+            .to_string(),
+    });
+    let mode = match params.mode.as_deref() {
+        Some("eval") => "eval",
+        _ => "score",
+    };
     let workers = params.workers.unwrap_or(4).clamp(1, classifier::MAX_WORKERS);
     let batch_size = params.batch_size.unwrap_or(16).max(1);
 
     let items: Vec<ClassifyItem> = {
         let conn = state.db.lock();
-        db::samples_for_classification(&conn, params.session_id, params.only_pending)?
+        db::samples_for_classification(&conn, params.session_id, params.only_pending || mode == "eval")?
             .into_iter()
             .map(|(id, text, path, format)| ClassifyItem { id, text, path, format })
             .collect()
@@ -476,13 +639,15 @@ pub async fn start_classifier_run(app: AppHandle, state: State<'_, AppState>, pa
         workers as i64,
         batch_size as i64,
         items.len() as i64,
+        model_row_id,
+        mode,
     )?;
     let job = state.jobs.start(
         Some(app),
         "classify",
         items.len() as u64,
-        &format!("classifying {} samples with {model_id}", items.len()),
-        serde_json::json!({ "run_id": run_id, "session_id": params.session_id }),
+        &format!("{} {} samples with {model_id}", if mode == "eval" { "evaluating" } else { "classifying" }, items.len()),
+        serde_json::json!({ "run_id": run_id, "session_id": params.session_id, "mode": mode }),
     );
     let job_id = job.id;
     let db = state.db.clone();
@@ -506,6 +671,14 @@ pub async fn start_classifier_run(app: AppHandle, state: State<'_, AppState>, pa
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_classifier_runs(state: State<'_, AppState>) -> Result<Vec<db::ClassifierRunInfo>> {
     db::list_runs(&state.db.lock())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn eval_report(state: State<'_, AppState>, run_id: i64) -> Result<db::EvalReport> {
+    let conn = state.db.lock();
+    let min_acc: f64 = db::get_setting(&conn, "eval_min_accuracy")?.and_then(|v| v.parse().ok()).unwrap_or(0.9);
+    let min_n: i64 = db::get_setting(&conn, "eval_min_evaluated")?.and_then(|v| v.parse().ok()).unwrap_or(100);
+    db::eval_report(&conn, run_id, min_acc, min_n)
 }
 
 #[tauri::command(rename_all = "snake_case")]

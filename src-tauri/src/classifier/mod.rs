@@ -4,8 +4,10 @@
 //! batches from a shared queue; predictions are written back to the DB by the
 //! coordinating thread.
 
+pub mod builtin;
 pub mod command;
 pub mod heuristic;
+pub mod train;
 
 use crate::db::{self, Db, NewPrediction};
 use crate::error::{GccfError, Result};
@@ -41,6 +43,11 @@ pub trait Backend: Send {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BackendSpec {
     Heuristic,
+    /// A model trained in-process (`builtin.rs`), loaded once and shared by
+    /// every worker thread.
+    Builtin {
+        path: String,
+    },
     Command {
         command: String,
         #[serde(default)]
@@ -54,12 +61,14 @@ impl BackendSpec {
     pub fn name(&self) -> &'static str {
         match self {
             BackendSpec::Heuristic => "heuristic",
+            BackendSpec::Builtin { .. } => "builtin",
             BackendSpec::Command { .. } => "command",
         }
     }
     pub fn command_line(&self) -> Option<String> {
         match self {
             BackendSpec::Heuristic => None,
+            BackendSpec::Builtin { path } => Some(path.clone()),
             BackendSpec::Command { command, args, .. } => {
                 let mut s = command.clone();
                 for a in args {
@@ -72,9 +81,16 @@ impl BackendSpec {
     }
 }
 
-pub fn make_backend(spec: &BackendSpec, worker_index: usize) -> anyhow::Result<Box<dyn Backend>> {
+pub fn make_backend(spec: &BackendSpec, worker_index: usize, shared: &Option<Arc<builtin::BuiltinModel>>) -> anyhow::Result<Box<dyn Backend>> {
     match spec {
         BackendSpec::Heuristic => Ok(Box::new(heuristic::Heuristic::default())),
+        BackendSpec::Builtin { path } => {
+            let model = match shared {
+                Some(m) => m.clone(),
+                None => Arc::new(builtin::BuiltinModel::load(std::path::Path::new(path))?),
+            };
+            Ok(Box::new(builtin::BuiltinBackend { model }))
+        }
         BackendSpec::Command { command, args, cwd } => Ok(Box::new(command::CommandBackend::spawn(
             command,
             args,
@@ -109,6 +125,14 @@ pub fn run_pool(
         return Ok(());
     }
 
+    // Built-in models are loaded once here and shared, not once per worker.
+    let shared: Option<Arc<builtin::BuiltinModel>> = match &spec {
+        BackendSpec::Builtin { path } => Some(Arc::new(
+            builtin::BuiltinModel::load(std::path::Path::new(path)).map_err(|e| GccfError::msg(e.to_string()))?,
+        )),
+        _ => None,
+    };
+
     let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<Vec<ClassifyItem>>();
     let (res_tx, res_rx) = crossbeam_channel::bounded::<BatchResult>(workers * 2);
     for chunk in items.chunks(batch_size) {
@@ -122,8 +146,9 @@ pub fn run_pool(
         let tx = res_tx.clone();
         let spec = spec.clone();
         let job = job.clone();
+        let shared = shared.clone();
         handles.push(std::thread::Builder::new().name(format!("gccf-clf-{w}")).spawn(move || {
-            let mut backend = match make_backend(&spec, w) {
+            let mut backend = match make_backend(&spec, w, &shared) {
                 Ok(b) => b,
                 Err(e) => {
                     // Report every batch we would have taken as failed.
